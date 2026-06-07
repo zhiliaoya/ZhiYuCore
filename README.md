@@ -10,7 +10,7 @@
 
 智语Core是一个使用C++和Dear ImGui开发的Windows桌面应用，通过全局鼠标/键盘钩子实现文本快速处理。用户只需选中文本并点击鼠标中键，即可自动调用DeepSeek API进行处理，处理结果实时显示在透明浮动窗口中。
 
-> **🤖 AI生成声明**：本项目所有代码均由DeepSeek生成，作者仅负责需求分析、设计思想、部署测试和反馈Bug。
+> **🤖 AI生成声明**：本项目所有代码均由DeepSeek生成及Claude纠正已知bug，作者仅负责需求分析、设计思想、部署测试和反馈Bug。
 
 ### 核心特性
 
@@ -160,6 +160,7 @@ ZhiYuCore/
 ## 🙏 致谢
 
 - [DeepSeek](https://deepseek.com) - 提供强大的API服务
+- [Claude](https://claude.ai/) - 提供的代码生成服务
 - [Dear ImGui](https://github.com/ocornut/imgui) - 优秀的即时模式GUI库
 - [nlohmann/json](https://github.com/nlohmann/json) - 便捷的JSON解析库
 
