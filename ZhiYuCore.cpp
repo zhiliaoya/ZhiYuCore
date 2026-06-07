@@ -190,32 +190,74 @@ void SaveConfig() {
     }
 }
 
+// 复制函数
+bool CopyToClipboard(const std::string& text) {
+    if (text.empty()) return false;
+
+    if (!OpenClipboard(nullptr)) return false;
+
+    // 先清空剪贴板
+    EmptyClipboard();
+
+    // 转换字符串
+    std::wstring wContent = StringToWString(text);
+    size_t size = (wContent.length() + 1) * sizeof(wchar_t);
+
+    // 分配内存
+    HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, size);
+    if (hMem) {
+        // 锁定内存并复制
+        wchar_t* pMem = (wchar_t*)GlobalLock(hMem);
+        if (pMem) {
+            memcpy(pMem, wContent.c_str(), size);
+            GlobalUnlock(hMem);
+
+            // 设置剪贴板数据
+            SetClipboardData(CF_UNICODETEXT, hMem);
+        }
+        else {
+            GlobalFree(hMem);
+        }
+    }
+
+    CloseClipboard();
+    return true;
+}
+
 // 根据提示词内容自动检测模式
 void DetectModeFromPrompt() {
-    std::string lower_prompt = g_system_prompt;
-    std::transform(lower_prompt.begin(), lower_prompt.end(), lower_prompt.begin(), ::tolower);
+    // 使用 ASCII-only tolower，跳过 0x80 以上的字节（UTF-8 中文多字节序列），
+    // 避免将有符号负值传入 ::tolower 导致未定义行为并破坏 UTF-8 编码
+    std::string lower_prompt;
+    lower_prompt.reserve(g_system_prompt.size());
+    for (unsigned char c : g_system_prompt) {
+        lower_prompt += (c < 0x80) ? (char)::tolower(c) : (char)c;
+    }
 
+    // 中文关键词用原始字符串查找，英文关键词用 lower_prompt 查找（已安全转小写）
     if (g_system_prompt.find("翻译") != std::string::npos &&
         (g_system_prompt.find("翻译成") != std::string::npos ||
-            g_system_prompt.find("translate") != std::string::npos)) {
+            lower_prompt.find("translate") != std::string::npos)) {
         g_current_mode = AgentMode::Translation;
         g_mode_display_name = "翻译";
         g_show_original_text = true;
     }
     else if (g_system_prompt.find("分析") != std::string::npos ||
-        g_system_prompt.find("分析文本") != std::string::npos) {
+        g_system_prompt.find("分析文本") != std::string::npos ||
+        lower_prompt.find("analysis") != std::string::npos ||
+        lower_prompt.find("analyze") != std::string::npos) {
         g_current_mode = AgentMode::Analysis;
         g_mode_display_name = "分析";
         g_show_original_text = false;
     }
     else if (g_system_prompt.find("总结") != std::string::npos ||
-        g_system_prompt.find("summar") != std::string::npos) {
+        lower_prompt.find("summar") != std::string::npos) {
         g_current_mode = AgentMode::Summary;
         g_mode_display_name = "总结";
         g_show_original_text = false;
     }
     else if (g_system_prompt.find("润色") != std::string::npos ||
-        g_system_prompt.find("polish") != std::string::npos) {
+        lower_prompt.find("polish") != std::string::npos) {
         g_current_mode = AgentMode::Polish;
         g_mode_display_name = "润色";
         g_show_original_text = false;
@@ -466,11 +508,18 @@ std::string GetClipboardText() {
             }
         }
         else {
+            // CF_TEXT 在 Windows 上是 ANSI 编码（简体中文系统为 GBK/CP936），
+            // 必须先转 wstring 再转 UTF-8，不能直接赋值给 std::string
             hData = GetClipboardData(CF_TEXT);
             if (hData) {
                 char* pszText = static_cast<char*>(GlobalLock(hData));
                 if (pszText) {
-                    text = pszText;
+                    int wlen = MultiByteToWideChar(CP_ACP, 0, pszText, -1, NULL, 0);
+                    if (wlen > 0) {
+                        std::wstring wstr(wlen, 0);
+                        MultiByteToWideChar(CP_ACP, 0, pszText, -1, &wstr[0], wlen);
+                        text = WStringToString(wstr);
+                    }
                     GlobalUnlock(hData);
                 }
             }
@@ -1281,25 +1330,16 @@ int WINAPI WinMain(HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _In_ L
             ImGui::Separator();
             ImGui::Spacing();
 
-            // 动态计算按钮数量
+            // 动态计算按钮数量：翻译模式有4个按钮（复制原文/复制翻译/重新翻译/关闭），
+            // 其他模式3个（复制结果/重新处理/关闭）
             int button_count = (g_current_mode == AgentMode::Translation) ? 4 : 3;
             float buttonWidth = (ImGui::GetContentRegionAvail().x - 20) / button_count;
 
-            // 复制原文按钮（仅翻译模式显示）
+            // 复制原文按钮（仅翻译模式显示，与 button_count=4 对应）
             if (g_current_mode == AgentMode::Translation) {
                 if (ImGui::Button("复制原文", ImVec2(buttonWidth, 35))) {
                     if (!g_clipboard_content.empty()) {
-                        if (OpenClipboard(nullptr)) {
-                            EmptyClipboard();
-                            std::wstring wContent = StringToWString(g_clipboard_content);
-                            HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, (wContent.length() + 1) * sizeof(wchar_t));
-                            if (hMem) {
-                                memcpy(GlobalLock(hMem), wContent.c_str(), (wContent.length() + 1) * sizeof(wchar_t));
-                                GlobalUnlock(hMem);
-                                SetClipboardData(CF_UNICODETEXT, hMem);
-                            }
-                            CloseClipboard();
-                        }
+                        CopyToClipboard(g_clipboard_content);
                     }
                 }
                 ImGui::SameLine();
@@ -1308,17 +1348,20 @@ int WINAPI WinMain(HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _In_ L
             // 复制结果按钮
             std::string copy_btn_text = "复制" + g_mode_display_name;
             if (ImGui::Button(copy_btn_text.c_str(), ImVec2(buttonWidth, 35))) {
-                if (!g_translated_content.empty() && !g_translation_error) {
-                    if (OpenClipboard(nullptr)) {
-                        EmptyClipboard();
-                        std::wstring wContent = StringToWString(g_translated_content);
-                        HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, (wContent.length() + 1) * sizeof(wchar_t));
-                        if (hMem) {
-                            memcpy(GlobalLock(hMem), wContent.c_str(), (wContent.length() + 1) * sizeof(wchar_t));
-                            GlobalUnlock(hMem);
-                            SetClipboardData(CF_UNICODETEXT, hMem);
-                        }
-                        CloseClipboard();
+                if (!g_translated_content.empty()) {
+                    std::string content_to_copy;
+
+                    if (g_translation_error) {
+                        // 如果出错，只复制错误信息部分，去掉"失败: "前缀
+                        content_to_copy = g_error_message;
+                    }
+                    else {
+                        // 正常情况复制翻译结果
+                        content_to_copy = g_translated_content;
+                    }
+
+                    if (!content_to_copy.empty()) {
+                        CopyToClipboard(content_to_copy);
                     }
                 }
             }
