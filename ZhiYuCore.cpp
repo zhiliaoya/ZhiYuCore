@@ -181,7 +181,7 @@ void SaveConfig() {
     try {
         std::ofstream file(configPath);
         if (file.is_open()) {
-            file << config.dump(4);
+            file << config.dump(4, ' ', false, json::error_handler_t::replace);
             file.close();
         }
     }
@@ -537,6 +537,68 @@ void SimulateCtrlC() {
     keybd_event(VK_CONTROL, 0x9d, KEYEVENTF_KEYUP, 0);
 }
 
+// UTF-8 字节流清洗函数
+// 剪贴板或配置文件读入的字符串可能含有非法 UTF-8 字节（如 GBK 残留、截断的多字节序列等）
+// nlohmann/json dump() 默认 strict 模式会对此抛出 type_error.316
+// 本函数将非法字节替换为 U+FFFD（替换字符），保证输出是合法 UTF-8
+static std::string SanitizeUtf8(const std::string& input) {
+    std::string output;
+    output.reserve(input.size());
+    size_t i = 0;
+    while (i < input.size()) {
+        unsigned char c = (unsigned char)input[i];
+        int seq_len = 0;
+        uint32_t codepoint = 0;
+
+        if (c < 0x80) {                          // 单字节 ASCII
+            seq_len = 1;
+            codepoint = c;
+        } else if ((c & 0xE0) == 0xC0) {         // 2 字节序列
+            seq_len = 2;
+            codepoint = c & 0x1F;
+        } else if ((c & 0xF0) == 0xE0) {         // 3 字节序列
+            seq_len = 3;
+            codepoint = c & 0x0F;
+        } else if ((c & 0xF8) == 0xF0) {         // 4 字节序列
+            seq_len = 4;
+            codepoint = c & 0x07;
+        } else {                                  // 非法首字节，替换为 U+FFFD
+            output += "\xEF\xBF\xBD";
+            ++i;
+            continue;
+        }
+
+        // 检查后续字节是否合法（必须是 10xxxxxx）
+        bool valid = true;
+        if (i + seq_len > input.size()) {
+            valid = false;
+        } else {
+            for (int k = 1; k < seq_len; ++k) {
+                unsigned char b = (unsigned char)input[i + k];
+                if ((b & 0xC0) != 0x80) { valid = false; break; }
+                codepoint = (codepoint << 6) | (b & 0x3F);
+            }
+        }
+
+        // 过长编码 / 超范围 codepoint 也视为非法
+        if (valid) {
+            if (seq_len == 2 && codepoint < 0x80)   valid = false;
+            if (seq_len == 3 && codepoint < 0x800)  valid = false;
+            if (seq_len == 4 && codepoint < 0x10000) valid = false;
+            if (codepoint > 0x10FFFF)                valid = false;
+        }
+
+        if (valid) {
+            output.append(input, i, seq_len);
+            i += seq_len;
+        } else {
+            output += "\xEF\xBF\xBD";  // U+FFFD
+            ++i;
+        }
+    }
+    return output;
+}
+
 // DeepSeek API调用函数
 std::string TranslateWithDeepSeek(const std::string& text) {
     if (text.empty()) return "";
@@ -572,16 +634,18 @@ std::string TranslateWithDeepSeek(const std::string& text) {
             final_system_prompt += "\n\n请将文本翻译为" + g_target_language + "。";
         }
 
-        systemMessage["content"] = final_system_prompt;
+        // 清洗所有即将写入 JSON 的字符串，防止非法 UTF-8 字节导致 dump() 抛出 type_error.316
+        systemMessage["content"] = SanitizeUtf8(final_system_prompt);
         messages.push_back(systemMessage);
 
         json userMessage;
         userMessage["role"] = "user";
-        userMessage["content"] = text;
+        userMessage["content"] = SanitizeUtf8(text);
         messages.push_back(userMessage);
 
         requestBody["messages"] = messages;
-        std::string requestStr = requestBody.dump();
+        // 使用 replace 错误处理模式作为额外保险（非法字节替换为 \uFFFD 而非抛异常）
+        std::string requestStr = requestBody.dump(-1, ' ', false, json::error_handler_t::replace);
 
         hSession = WinHttpOpen(L"ZhiYuCore/1.0",
             WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
