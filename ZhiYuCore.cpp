@@ -181,7 +181,7 @@ void SaveConfig() {
     try {
         std::ofstream file(configPath);
         if (file.is_open()) {
-            file << config.dump(4, ' ', false, json::error_handler_t::replace);
+            file << config.dump(4);
             file.close();
         }
     }
@@ -226,38 +226,30 @@ bool CopyToClipboard(const std::string& text) {
 
 // 根据提示词内容自动检测模式
 void DetectModeFromPrompt() {
-    // 使用 ASCII-only tolower，跳过 0x80 以上的字节（UTF-8 中文多字节序列），
-    // 避免将有符号负值传入 ::tolower 导致未定义行为并破坏 UTF-8 编码
-    std::string lower_prompt;
-    lower_prompt.reserve(g_system_prompt.size());
-    for (unsigned char c : g_system_prompt) {
-        lower_prompt += (c < 0x80) ? (char)::tolower(c) : (char)c;
-    }
+    std::string lower_prompt = g_system_prompt;
+    std::transform(lower_prompt.begin(), lower_prompt.end(), lower_prompt.begin(), ::tolower);
 
-    // 中文关键词用原始字符串查找，英文关键词用 lower_prompt 查找（已安全转小写）
     if (g_system_prompt.find("翻译") != std::string::npos &&
         (g_system_prompt.find("翻译成") != std::string::npos ||
-            lower_prompt.find("translate") != std::string::npos)) {
+            g_system_prompt.find("translate") != std::string::npos)) {
         g_current_mode = AgentMode::Translation;
         g_mode_display_name = "翻译";
         g_show_original_text = true;
     }
     else if (g_system_prompt.find("分析") != std::string::npos ||
-        g_system_prompt.find("分析文本") != std::string::npos ||
-        lower_prompt.find("analysis") != std::string::npos ||
-        lower_prompt.find("analyze") != std::string::npos) {
+        g_system_prompt.find("分析文本") != std::string::npos) {
         g_current_mode = AgentMode::Analysis;
         g_mode_display_name = "分析";
         g_show_original_text = false;
     }
     else if (g_system_prompt.find("总结") != std::string::npos ||
-        lower_prompt.find("summar") != std::string::npos) {
+        g_system_prompt.find("summar") != std::string::npos) {
         g_current_mode = AgentMode::Summary;
         g_mode_display_name = "总结";
         g_show_original_text = false;
     }
     else if (g_system_prompt.find("润色") != std::string::npos ||
-        lower_prompt.find("polish") != std::string::npos) {
+        g_system_prompt.find("polish") != std::string::npos) {
         g_current_mode = AgentMode::Polish;
         g_mode_display_name = "润色";
         g_show_original_text = false;
@@ -508,17 +500,20 @@ std::string GetClipboardText() {
             }
         }
         else {
-            // CF_TEXT 在 Windows 上是 ANSI 编码（简体中文系统为 GBK/CP936），
-            // 必须先转 wstring 再转 UTF-8，不能直接赋值给 std::string
             hData = GetClipboardData(CF_TEXT);
             if (hData) {
                 char* pszText = static_cast<char*>(GlobalLock(hData));
                 if (pszText) {
+                    // CF_TEXT 是系统ANSI代码页编码（如中文系统下的GBK），
+                    // 必须先转成宽字符再转成UTF-8，否则含中文时会产生非法UTF-8字节，
+                    // 导致后续 json.dump() 抛出 type_error.316
                     int wlen = MultiByteToWideChar(CP_ACP, 0, pszText, -1, NULL, 0);
                     if (wlen > 0) {
-                        std::wstring wstr(wlen, 0);
-                        MultiByteToWideChar(CP_ACP, 0, pszText, -1, &wstr[0], wlen);
-                        text = WStringToString(wstr);
+                        std::wstring wtext(wlen, 0);
+                        MultiByteToWideChar(CP_ACP, 0, pszText, -1, &wtext[0], wlen);
+                        // 去掉MultiByteToWideChar在-1模式下带出的结尾空字符
+                        if (!wtext.empty() && wtext.back() == L'\0') wtext.pop_back();
+                        text = WStringToString(wtext);
                     }
                     GlobalUnlock(hData);
                 }
@@ -537,66 +532,38 @@ void SimulateCtrlC() {
     keybd_event(VK_CONTROL, 0x9d, KEYEVENTF_KEYUP, 0);
 }
 
-// UTF-8 字节流清洗函数
-// 剪贴板或配置文件读入的字符串可能含有非法 UTF-8 字节（如 GBK 残留、截断的多字节序列等）
-// nlohmann/json dump() 默认 strict 模式会对此抛出 type_error.316
-// 本函数将非法字节替换为 U+FFFD（替换字符），保证输出是合法 UTF-8
-static std::string SanitizeUtf8(const std::string& input) {
-    std::string output;
-    output.reserve(input.size());
-    size_t i = 0;
-    while (i < input.size()) {
-        unsigned char c = (unsigned char)input[i];
-        int seq_len = 0;
-        uint32_t codepoint = 0;
+// 清理字符串中的非法UTF-8字节，防止 json::dump() 抛出 type_error.316
+// 采用UTF-8状态机逐字节校验，遇到非法序列直接丢弃该字节
+std::string SanitizeUtf8(const std::string& input) {
+    std::string out;
+    out.reserve(input.size());
+    size_t i = 0, n = input.size();
+    while (i < n) {
+        unsigned char c = static_cast<unsigned char>(input[i]);
+        int len = 0;
+        if ((c & 0x80) == 0x00) len = 1;
+        else if ((c & 0xE0) == 0xC0) len = 2;
+        else if ((c & 0xF0) == 0xE0) len = 3;
+        else if ((c & 0xF8) == 0xF0) len = 4;
+        else { i++; continue; } // 非法起始字节，丢弃
 
-        if (c < 0x80) {                          // 单字节 ASCII
-            seq_len = 1;
-            codepoint = c;
-        } else if ((c & 0xE0) == 0xC0) {         // 2 字节序列
-            seq_len = 2;
-            codepoint = c & 0x1F;
-        } else if ((c & 0xF0) == 0xE0) {         // 3 字节序列
-            seq_len = 3;
-            codepoint = c & 0x0F;
-        } else if ((c & 0xF8) == 0xF0) {         // 4 字节序列
-            seq_len = 4;
-            codepoint = c & 0x07;
-        } else {                                  // 非法首字节，替换为 U+FFFD
-            output += "\xEF\xBF\xBD";
-            ++i;
-            continue;
-        }
+        if (i + len > n) { i++; continue; } // 序列不完整，丢弃
 
-        // 检查后续字节是否合法（必须是 10xxxxxx）
         bool valid = true;
-        if (i + seq_len > input.size()) {
-            valid = false;
-        } else {
-            for (int k = 1; k < seq_len; ++k) {
-                unsigned char b = (unsigned char)input[i + k];
-                if ((b & 0xC0) != 0x80) { valid = false; break; }
-                codepoint = (codepoint << 6) | (b & 0x3F);
-            }
-        }
-
-        // 过长编码 / 超范围 codepoint 也视为非法
-        if (valid) {
-            if (seq_len == 2 && codepoint < 0x80)   valid = false;
-            if (seq_len == 3 && codepoint < 0x800)  valid = false;
-            if (seq_len == 4 && codepoint < 0x10000) valid = false;
-            if (codepoint > 0x10FFFF)                valid = false;
+        for (int k = 1; k < len; k++) {
+            unsigned char cc = static_cast<unsigned char>(input[i + k]);
+            if ((cc & 0xC0) != 0x80) { valid = false; break; }
         }
 
         if (valid) {
-            output.append(input, i, seq_len);
-            i += seq_len;
-        } else {
-            output += "\xEF\xBF\xBD";  // U+FFFD
-            ++i;
+            out.append(input, i, len);
+            i += len;
+        }
+        else {
+            i++; // 丢弃这个非法起始字节，从下一个字节重试
         }
     }
-    return output;
+    return out;
 }
 
 // DeepSeek API调用函数
@@ -634,7 +601,6 @@ std::string TranslateWithDeepSeek(const std::string& text) {
             final_system_prompt += "\n\n请将文本翻译为" + g_target_language + "。";
         }
 
-        // 清洗所有即将写入 JSON 的字符串，防止非法 UTF-8 字节导致 dump() 抛出 type_error.316
         systemMessage["content"] = SanitizeUtf8(final_system_prompt);
         messages.push_back(systemMessage);
 
@@ -644,8 +610,7 @@ std::string TranslateWithDeepSeek(const std::string& text) {
         messages.push_back(userMessage);
 
         requestBody["messages"] = messages;
-        // 使用 replace 错误处理模式作为额外保险（非法字节替换为 \uFFFD 而非抛异常）
-        std::string requestStr = requestBody.dump(-1, ' ', false, json::error_handler_t::replace);
+        std::string requestStr = requestBody.dump();
 
         hSession = WinHttpOpen(L"ZhiYuCore/1.0",
             WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
@@ -840,9 +805,20 @@ LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
             MSLLHOOKSTRUCT* pMouseStruct = (MSLLHOOKSTRUCT*)lParam;
             g_mouse_pos = pMouseStruct->pt;
 
+            // 记录模拟复制前的剪贴板序列号，用于判断本次点击是否真的复制到了新内容。
+            // 如果点击处没有选中文本，Ctrl+C 不会写入剪贴板，序列号不会变，
+            // 此时不应该用旧的剪贴板内容再次触发AI处理。
+            DWORD seqBefore = GetClipboardSequenceNumber();
+
             Sleep(50);
             SimulateCtrlC();
             Sleep(100);
+
+            DWORD seqAfter = GetClipboardSequenceNumber();
+            if (seqAfter == seqBefore) {
+                // 没有产生新的复制动作（未选中文本），跳过本次处理
+                return CallNextHookEx(g_mouse_hook, nCode, wParam, lParam);
+            }
 
             std::string content = GetClipboardText();
 
@@ -1394,19 +1370,15 @@ int WINAPI WinMain(HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _In_ L
             ImGui::Separator();
             ImGui::Spacing();
 
-            // 动态计算按钮数量：翻译模式有4个按钮（复制原文/复制翻译/重新翻译/关闭），
-            // 其他模式3个（复制结果/重新处理/关闭）
+            // 动态计算按钮数量
             int button_count = (g_current_mode == AgentMode::Translation) ? 4 : 3;
             float buttonWidth = (ImGui::GetContentRegionAvail().x - 20) / button_count;
 
-            // 复制原文按钮（仅翻译模式显示，与 button_count=4 对应）
-            if (g_current_mode == AgentMode::Translation) {
-                if (ImGui::Button("复制原文", ImVec2(buttonWidth, 35))) {
-                    if (!g_clipboard_content.empty()) {
-                        CopyToClipboard(g_clipboard_content);
-                    }
+            // 复制原文按钮（仅翻译模式显示）
+            if (ImGui::Button("复制原文", ImVec2(buttonWidth, 35))) {
+                if (!g_clipboard_content.empty()) {
+                    CopyToClipboard(g_clipboard_content);  // 调用了一个可能有问题的函数
                 }
-                ImGui::SameLine();
             }
 
             // 复制结果按钮
